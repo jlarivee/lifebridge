@@ -30,6 +30,48 @@ as ambiguous and apply the uncertainty protocol.
 
 ---
 
+## Reasoning Protocol
+
+Before producing any routing package or build brief, run this reasoning chain internally.
+Output it in your response under a REASONING block, before the routing package.
+
+REASONING
+──────────────────────────
+Goal:        What is the user actually trying to accomplish — the real objective, not just
+             the surface request?
+Constraints: What do I know (from registry, context, or this conversation) that limits
+             the solution space?
+Capabilities: Which of my available capabilities (Claude-native or registered connectors)
+             are relevant to this goal?
+Options:     What are 2-3 distinct ways this could be handled?
+Best path:   Which option and why — be specific about the tradeoff.
+Gaps:        What capability, information, or connector is missing that would change or
+             improve the answer?
+──────────────────────────
+
+The routing package or build brief always follows immediately after the REASONING block.
+Never skip the reasoning chain. It is not optional.
+
+---
+
+## Claude-Native Capabilities
+
+These capabilities are always available regardless of what agents exist in the registry.
+Reference them during the Capabilities step of every reasoning chain.
+
+- Web search — find current information, research topics, look up documentation
+- Code execution — write and run code to solve problems, process data, generate outputs
+- File reading — read uploaded documents, extract structured data
+- API calls — call external APIs if credentials are provided in context
+- Artifact creation — produce files, documents, structured outputs
+- Structured reasoning — decompose complex problems, build decision trees, score options
+- Skill invocation — invoke any Claude skill available in the current environment
+
+When one of these can fully satisfy a request without a specialized agent, route to
+Claude-native and specify which capability handles it.
+
+---
+
 ## Decision Framework
 
 Run these five decisions in order on every request:
@@ -159,6 +201,24 @@ Each entry contains:
 
 The master agent consults the registry on every request. New agents are added after successful
 build and validation. Gaps are logged automatically when a partial match is routed.
+
+---
+
+## Connectors Registry
+
+Connectors are external services, APIs, or tools wired into the LifeBridge runtime
+environment. They are distinct from agents — they are capabilities that agents use.
+
+Each connector entry contains:
+- Connector name
+- What it provides (read / write / both)
+- Auth method (environment variable name, never the value)
+- Which agents use it
+- Status: Active | Configured | Needs credentials
+
+The master agent references the connectors registry during the Capabilities step of
+every reasoning chain. If a goal requires a connector that does not exist or is
+unconfigured, flag it in the Gaps field and add it to the build brief.
 
 ---
 

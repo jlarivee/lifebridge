@@ -1,5 +1,15 @@
 {
   "agents": [],
   "domain_signals": [],
-  "pending_builds": []
+  "pending_builds": [],
+  "connectors": [],
+  "claude_capabilities": [
+    "web_search",
+    "code_execution",
+    "file_reading",
+    "api_calls",
+    "artifact_creation",
+    "structured_reasoning",
+    "skill_invocation"
+  ]
 }

@@ -33,7 +33,7 @@ app = Flask(__name__)
 def load_registry():
     if REGISTRY_PATH.exists():
         return json.loads(REGISTRY_PATH.read_text())
-    return {"agents": [], "domain_signals": [], "pending_builds": []}
+    return {"agents": [], "domain_signals": [], "pending_builds": [], "connectors": [], "claude_capabilities": []}
 
 def save_registry(data):
     REGISTRY_PATH.write_text(json.dumps(data, indent=2))
@@ -42,15 +42,20 @@ def save_registry(data):
 
 def route_request(user_input):
     registry = load_registry()
-    registry_context = json.dumps(registry, indent=2)
+
+    registry_block = f"""[REGISTRY STATE]
+Agents: {json.dumps(registry.get('agents', []))}
+Connectors: {json.dumps(registry.get('connectors', []))}
+Claude-native capabilities: {json.dumps(registry.get('claude_capabilities', []))}
+Domain signals learned: {json.dumps(registry.get('domain_signals', []))}
+Pending builds: {json.dumps(registry.get('pending_builds', []))}
+[END REGISTRY STATE]"""
 
     messages = [{
         "role": "user",
-        "content": f"""CAPABILITY REGISTRY (current state):
-{registry_context}
+        "content": f"""{registry_block}
 
-USER REQUEST:
-{user_input}"""
+User request: {user_input}"""
     }]
 
     resp = client.messages.create(
@@ -92,6 +97,8 @@ def api_registry_update():
         registry["domain_signals"].append(body["domain_signal"])
     if "pending_build" in body:
         registry["pending_builds"].append(body["pending_build"])
+    if "connector" in body:
+        registry.setdefault("connectors", []).append(body["connector"])
 
     save_registry(registry)
     return jsonify({"status": "updated", "registry": registry})
@@ -202,6 +209,22 @@ HTML = """<!DOCTYPE html>
     0% { content:''; } 25% { content:'.'; } 50% { content:'..'; } 75% { content:'...'; }
   }
 
+  .reasoning-toggle {
+    font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em;
+    color:#555; cursor:pointer; margin-bottom:8px; user-select:none;
+  }
+  .reasoning-toggle:hover { color:#888; }
+  .reasoning-block {
+    font-family:'JetBrains Mono',monospace; font-size:11px; line-height:1.6;
+    color:#888; white-space:pre-wrap; word-break:break-word;
+    padding:12px 16px; background:#0a0a10; border-radius:6px;
+    border-left:3px solid #333; margin-bottom:12px;
+  }
+  .reasoning-label {
+    font-family:'JetBrains Mono',monospace; font-size:9px; letter-spacing:0.12em;
+    color:#555; text-transform:uppercase; margin-bottom:4px;
+  }
+
   @media(max-width:700px) {
     body { flex-direction:column; }
     .sidebar { width:100%; max-height:200px; border-right:none; border-bottom:1px solid #1c1c26; }
@@ -219,6 +242,10 @@ HTML = """<!DOCTYPE html>
   <div class="section">
     <div class="section-title">Domain Signals</div>
     <div id="signals-list"><div class="empty">No signals logged</div></div>
+  </div>
+  <div class="section">
+    <div class="section-title">Connectors</div>
+    <div id="connectors-list"><div class="empty">No connectors</div></div>
   </div>
   <div class="section">
     <div class="section-title">Pending Builds</div>
@@ -272,7 +299,7 @@ async function send() {
     if (data.error) {
       el.querySelector('.body').textContent = 'ERROR: ' + data.error;
     } else {
-      el.querySelector('.body').textContent = data.output;
+      el.querySelector('.body').innerHTML = formatResponse(data.output);
     }
   } catch (e) {
     const el = document.getElementById(loadId);
@@ -286,11 +313,44 @@ async function send() {
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
+function formatResponse(raw) {
+  // Split on REASONING block boundaries
+  const reasoningStart = raw.indexOf('REASONING');
+  if (reasoningStart === -1) return esc(raw);
+
+  // Find the end of the reasoning block (next ────── line after the content)
+  const lines = raw.split('\\n');
+  let rStart = -1, rEnd = -1, dashCount = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim().startsWith('REASONING')) { rStart = i; dashCount = 0; continue; }
+    if (rStart >= 0 && lines[i].includes('──────')) {
+      dashCount++;
+      if (dashCount === 1) continue; // opening line
+      if (dashCount === 2) { rEnd = i; break; } // closing line
+    }
+  }
+
+  if (rStart === -1 || rEnd === -1) return esc(raw);
+
+  const before = lines.slice(0, rStart).join('\\n').trim();
+  const reasoning = lines.slice(rStart, rEnd + 1).join('\\n').trim();
+  const after = lines.slice(rEnd + 1).join('\\n').trim();
+
+  const toggleId = 'reason-' + Date.now();
+  let html = '';
+  if (before) html += esc(before) + '\\n';
+  html += `<div class="reasoning-toggle" onclick="document.getElementById('${toggleId}').style.display = document.getElementById('${toggleId}').style.display === 'none' ? 'block' : 'none'">▶ Show reasoning</div>`;
+  html += `<div id="${toggleId}" style="display:none"><div class="reasoning-label">Agent reasoning</div><div class="reasoning-block">${esc(reasoning)}</div></div>`;
+  if (after) html += esc(after);
+  return html;
+}
+
 async function refreshRegistry() {
   try {
     const res = await fetch('/registry');
     const reg = await res.json();
     renderList('agents-list', reg.agents, a => `<strong>${a.name || a}</strong>`);
+    renderList('connectors-list', reg.connectors || [], c => typeof c === 'string' ? c : `<strong>${c.name || ''}</strong> ${c.provides || ''}`);
     renderList('signals-list', reg.domain_signals, s => typeof s === 'string' ? s : JSON.stringify(s));
     renderList('builds-list', reg.pending_builds, b => typeof b === 'string' ? b : `<strong>${b.name || ''}</strong> ${b.purpose || ''}`);
   } catch {}
