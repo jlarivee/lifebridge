@@ -7,6 +7,11 @@ Master agent orchestration server.
 import os
 import sys
 import json
+import uuid
+import re
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, request, jsonify, Response
@@ -24,9 +29,42 @@ MODEL = "claude-sonnet-4-20250514"
 ROOT = Path(__file__).parent
 SYSTEM_PROMPT = (ROOT / "system-prompt.txt").read_text()
 REGISTRY_PATH = ROOT / "registry.json"
+REQUEST_LOG_PATH = ROOT / "request-log.json"
 
 client = anthropic.Anthropic(api_key=API_KEY)
 app = Flask(__name__)
+
+# ── Request logging ──────────────────────────────────────────────────────────
+
+def _load_json(path):
+    if path.exists():
+        return json.loads(path.read_text())
+    return []
+
+def _save_json(path, data):
+    path.write_text(json.dumps(data, indent=2, default=str))
+
+def _parse_routing_field(text, field):
+    """Extract a field value from routing package text."""
+    match = re.search(rf'{field}:\s*(.+)', text)
+    return match.group(1).strip() if match else ""
+
+def log_request(user_input, response_text):
+    """Append a request entry to request-log.json."""
+    entry = {
+        "id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat(),
+        "input": user_input,
+        "domain": _parse_routing_field(response_text, "Domain"),
+        "routed_to": _parse_routing_field(response_text, "Route to"),
+        "approval_required": "APPROVAL REQUIRED" in response_text,
+        "clarification_asked": "?" in response_text and "ROUTING PACKAGE" not in response_text,
+        "build_brief_triggered": "BUILD BRIEF" in response_text,
+        "raw_response": response_text,
+    }
+    log = _load_json(REQUEST_LOG_PATH)
+    log.append(entry)
+    _save_json(REQUEST_LOG_PATH, log)
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
@@ -78,6 +116,7 @@ def api_route():
 
     try:
         output = route_request(user_input)
+        log_request(user_input, output)
         return jsonify({"input": user_input, "output": output})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -102,6 +141,52 @@ def api_registry_update():
 
     save_registry(registry)
     return jsonify({"status": "updated", "registry": registry})
+
+# ── Improvement endpoints ────────────────────────────────────────────────────
+
+@app.route("/improve/run", methods=["POST"])
+def api_improve_run():
+    try:
+        from improvement_agent import run_improvement_cycle
+        proposal = run_improvement_cycle(API_KEY)
+        return jsonify(proposal)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/improve/approve", methods=["POST"])
+def api_improve_approve():
+    body = request.get_json(silent=True) or {}
+    pid = body.get("proposal_id", "")
+    cidx = body.get("change_index")
+    if not pid or cidx is None:
+        return jsonify({"error": "proposal_id and change_index required"}), 400
+    try:
+        from improvement_agent import apply_change
+        desc = apply_change(pid, int(cidx))
+        # Reload system prompt in case it was edited
+        global SYSTEM_PROMPT
+        SYSTEM_PROMPT = (ROOT / "system-prompt.txt").read_text()
+        return jsonify({"success": True, "change_applied": desc})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/improve/reject", methods=["POST"])
+def api_improve_reject():
+    body = request.get_json(silent=True) or {}
+    pid = body.get("proposal_id", "")
+    cidx = body.get("change_index")
+    if not pid or cidx is None:
+        return jsonify({"error": "proposal_id and change_index required"}), 400
+    try:
+        from improvement_agent import reject_change
+        reject_change(pid, int(cidx))
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/improve/history", methods=["GET"])
+def api_improve_history():
+    return jsonify(_load_json(ROOT / "improvement-history.json"))
 
 @app.route("/")
 def index():
@@ -225,6 +310,54 @@ HTML = """<!DOCTYPE html>
     color:#555; text-transform:uppercase; margin-bottom:4px;
   }
 
+  /* Nav tabs */
+  .nav-tabs {
+    display:flex; border-bottom:1px solid #1c1c26; background:#101016;
+  }
+  .nav-tab {
+    font-family:'JetBrains Mono',monospace; font-size:11px; letter-spacing:0.08em;
+    padding:12px 20px; cursor:pointer; border:none; background:transparent;
+    color:#555; text-transform:uppercase; border-bottom:2px solid transparent;
+  }
+  .nav-tab.active { color:#d4d4dc; border-bottom-color:#6366f1; }
+  .nav-tab.improve-active { color:#d4d4dc; border-bottom-color:#f59e0b; }
+  .nav-tab:hover { color:#888; }
+
+  /* Improvement panel */
+  .improve-panel { flex:1; overflow-y:auto; padding:24px 28px; display:none; }
+  .improve-panel.visible { display:block; }
+
+  .imp-btn {
+    background:#f59e0b; border:none; border-radius:8px; color:#000;
+    padding:12px 24px; font-size:13px; font-weight:600; cursor:pointer;
+    font-family:'JetBrains Mono',monospace; letter-spacing:0.06em;
+  }
+  .imp-btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .imp-btn.sm { padding:6px 12px; font-size:10px; border-radius:6px; }
+  .imp-btn.approve { background:#22c55e; }
+  .imp-btn.reject { background:transparent; border:1px solid #555; color:#888; }
+
+  .proposal-card {
+    background:#16161e; border:1px solid #1c1c26; border-radius:8px;
+    padding:16px 20px; margin-bottom:16px;
+  }
+  .proposal-card.resolved { opacity:0.5; }
+  .change-card {
+    background:#0f0f16; border:1px solid #1a1a24; border-radius:6px;
+    padding:12px 16px; margin-bottom:8px; border-left:3px solid #f59e0b;
+  }
+  .change-card.approved-card { border-left-color:#22c55e; opacity:0.6; }
+  .change-card.rejected-card { border-left-color:#555; opacity:0.3; }
+  .change-field {
+    font-family:'JetBrains Mono',monospace; font-size:10px;
+    color:#555; letter-spacing:0.08em; text-transform:uppercase;
+    margin-bottom:2px;
+  }
+  .change-value {
+    font-size:12px; color:#c8c8d4; line-height:1.5; margin-bottom:8px;
+    white-space:pre-wrap; word-break:break-word;
+  }
+
   @media(max-width:700px) {
     body { flex-direction:column; }
     .sidebar { width:100%; max-height:200px; border-right:none; border-bottom:1px solid #1c1c26; }
@@ -259,9 +392,15 @@ HTML = """<!DOCTYPE html>
     <span class="tag">MASTER AGENT v1</span>
   </div>
 
-  <div class="output-area" id="output"></div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" id="tab-routing" onclick="switchTab('routing')">Routing</button>
+    <button class="nav-tab" id="tab-improve" onclick="switchTab('improve')">Improvement</button>
+  </div>
 
-  <div class="input-area">
+  <div class="output-area" id="output"></div>
+  <div class="improve-panel" id="improve-panel"></div>
+
+  <div class="input-area" id="routing-input">
     <input id="input" type="text" placeholder="Enter a request for the master agent..." autocomplete="off">
     <button id="submit" onclick="send()">ROUTE</button>
   </div>
@@ -366,14 +505,245 @@ function renderList(id, items, fmt) {
 }
 
 refreshRegistry();
+
+// ── Tab switching ────────────────────────────────────────────────
+function switchTab(tab) {
+  const routing = document.getElementById('output');
+  const routingInput = document.getElementById('routing-input');
+  const improve = document.getElementById('improve-panel');
+  const tabR = document.getElementById('tab-routing');
+  const tabI = document.getElementById('tab-improve');
+
+  if (tab === 'routing') {
+    routing.style.display = 'block';
+    routingInput.style.display = 'flex';
+    improve.classList.remove('visible');
+    tabR.classList.add('active'); tabR.classList.remove('improve-active');
+    tabI.classList.remove('active'); tabI.classList.remove('improve-active');
+  } else {
+    routing.style.display = 'none';
+    routingInput.style.display = 'none';
+    improve.classList.add('visible');
+    tabI.classList.add('improve-active');
+    tabR.classList.remove('active');
+    renderImprovePanel();
+  }
+}
+
+// ── Improvement panel ────────────────────────────────────────────
+async function renderImprovePanel() {
+  const panel = document.getElementById('improve-panel');
+  let history = [];
+  try {
+    const res = await fetch('/improve/history');
+    history = await res.json();
+  } catch {}
+
+  const pending = history.filter(p => p.status === 'pending');
+  const resolved = history.filter(p => p.status !== 'pending');
+
+  let html = `
+    <div style="margin-bottom:24px;">
+      <button class="imp-btn" id="run-improve-btn" onclick="runImprove()">Run improvement cycle now</button>
+      <span id="improve-status" style="margin-left:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#555;"></span>
+    </div>
+  `;
+
+  if (pending.length > 0) {
+    html += `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.12em;color:#f59e0b;text-transform:uppercase;margin-bottom:12px;">Pending Proposals (${pending.length})</div>`;
+    for (const p of pending) {
+      html += renderProposal(p, false);
+    }
+  }
+
+  if (resolved.length > 0) {
+    html += `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.12em;color:#555;text-transform:uppercase;margin:24px 0 12px;">History (${resolved.length})</div>`;
+    for (const p of resolved.reverse().slice(0, 10)) {
+      html += renderProposal(p, true);
+    }
+  }
+
+  if (history.length === 0) {
+    html += `<div style="color:#333;font-style:italic;margin-top:20px;">No improvement proposals yet. Run a cycle after routing some requests.</div>`;
+  }
+
+  panel.innerHTML = html;
+}
+
+function renderProposal(p, collapsed) {
+  // Parse sections from proposal text
+  const text = p.proposal || '';
+  const patternsMatch = text.match(/PATTERNS OBSERVED\n([\s\S]*?)(?=PROPOSED CHANGES|$)/);
+  const assessmentMatch = text.match(/OVERALL ASSESSMENT\n([\s\S]*?)(?=──────|$)/);
+  const patterns = patternsMatch ? patternsMatch[1].trim() : '';
+  const assessment = assessmentMatch ? assessmentMatch[1].trim() : '';
+
+  // Parse individual changes
+  const changeParts = text.split(/Change\s*\[?\d+\]?\s*:/);
+  const changes = [];
+  for (let i = 1; i < changeParts.length; i++) {
+    const c = changeParts[i];
+    const get = (f) => { const m = c.match(new RegExp(f + ':\\\\s*(.*?)(?=\\\\n\\\\s*(?:Type|Evidence|Current|Proposed|Reasoning|Risk|Confidence|$))', 's')); return m ? m[1].trim() : ''; };
+    changes.push({
+      type: get('Type') || extractField(c, 'Type'),
+      evidence: get('Evidence') || extractField(c, 'Evidence'),
+      current: get('Current') || extractField(c, 'Current'),
+      proposed: get('Proposed') || extractField(c, 'Proposed'),
+      reasoning: get('Reasoning') || extractField(c, 'Reasoning'),
+      risk: get('Risk') || extractField(c, 'Risk'),
+      confidence: get('Confidence') || extractField(c, 'Confidence'),
+    });
+  }
+
+  const approvedIdxs = (p.approved_changes || []).map(a => a.change_index);
+  const rejectedIdxs = (p.rejected_changes || []).map(r => r.change_index);
+
+  let html = `<div class="proposal-card ${p.status !== 'pending' ? 'resolved' : ''}">`;
+  html += `<div style="display:flex;justify-content:space-between;margin-bottom:8px;">`;
+  html += `<span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#888;">${p.timestamp?.slice(0,10)} · ${p.requests_reviewed || 0} requests</span>`;
+  html += `<span style="font-family:'JetBrains Mono',monospace;font-size:10px;padding:2px 8px;border-radius:4px;background:${p.status==='pending'?'#f59e0b22':'#33333344'};color:${p.status==='pending'?'#f59e0b':'#555'};">${p.status}</span>`;
+  html += `</div>`;
+
+  if (!collapsed) {
+    if (patterns) {
+      html += `<div class="change-field">Patterns Observed</div>`;
+      html += `<div class="change-value">${esc(patterns)}</div>`;
+    }
+    if (assessment) {
+      html += `<div class="change-field">Overall Assessment</div>`;
+      html += `<div class="change-value">${esc(assessment)}</div>`;
+    }
+
+    for (let i = 0; i < changes.length; i++) {
+      const ch = changes[i];
+      const isApproved = approvedIdxs.includes(i);
+      const isRejected = rejectedIdxs.includes(i);
+      const cls = isApproved ? 'approved-card' : isRejected ? 'rejected-card' : '';
+
+      html += `<div class="change-card ${cls}">`;
+      html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">`;
+      html += `<span style="font-size:12px;font-weight:600;color:#d4d4dc;">Change ${i+1}</span>`;
+      if (ch.confidence) html += `<span style="font-size:10px;color:${ch.confidence==='High'?'#22c55e':ch.confidence==='Medium'?'#f59e0b':'#888'};font-family:'JetBrains Mono',monospace;">${ch.confidence}</span>`;
+      html += `</div>`;
+
+      if (ch.type) { html += `<div class="change-field">Type</div><div class="change-value">${esc(ch.type)}</div>`; }
+      if (ch.evidence) { html += `<div class="change-field">Evidence</div><div class="change-value">${esc(ch.evidence)}</div>`; }
+      if (ch.reasoning) { html += `<div class="change-field">Reasoning</div><div class="change-value">${esc(ch.reasoning)}</div>`; }
+      if (ch.risk) { html += `<div class="change-field">Risk</div><div class="change-value">${esc(ch.risk)}</div>`; }
+
+      if (ch.current || ch.proposed) {
+        html += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0;">`;
+        html += `<div><div class="change-field">Current</div><div style="background:#1a0a0a;border:1px solid #331a1a;border-radius:4px;padding:8px;font-size:11px;color:#c88;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;">${esc(ch.current || '(none)')}</div></div>`;
+        html += `<div><div class="change-field">Proposed</div><div style="background:#0a1a0a;border:1px solid #1a331a;border-radius:4px;padding:8px;font-size:11px;color:#8c8;font-family:'JetBrains Mono',monospace;white-space:pre-wrap;">${esc(ch.proposed || '(none)')}</div></div>`;
+        html += `</div>`;
+      }
+
+      if (!isApproved && !isRejected && p.status === 'pending') {
+        html += `<div style="display:flex;gap:8px;margin-top:8px;">`;
+        html += `<button class="imp-btn sm approve" onclick="approveChange('${p.id}',${i})">APPROVE</button>`;
+        html += `<button class="imp-btn sm reject" onclick="rejectChange('${p.id}',${i})">REJECT</button>`;
+        html += `</div>`;
+      } else if (isApproved) {
+        html += `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#22c55e;margin-top:6px;">✓ Approved</div>`;
+      } else if (isRejected) {
+        html += `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#555;margin-top:6px;">✗ Rejected</div>`;
+      }
+
+      html += `</div>`;
+    }
+  }
+
+  html += `</div>`;
+  return html;
+}
+
+function extractField(text, field) {
+  const lines = text.split('\\n');
+  for (const line of lines) {
+    if (line.trim().startsWith(field + ':')) {
+      return line.trim().substring(field.length + 1).trim();
+    }
+  }
+  return '';
+}
+
+async function runImprove() {
+  const btn = document.getElementById('run-improve-btn');
+  const status = document.getElementById('improve-status');
+  btn.disabled = true;
+  status.textContent = 'Running analysis...';
+  status.style.color = '#f59e0b';
+  try {
+    const res = await fetch('/improve/run', { method: 'POST' });
+    const data = await res.json();
+    if (data.error) {
+      status.textContent = 'Error: ' + data.error;
+      status.style.color = '#ef4444';
+    } else {
+      status.textContent = 'Proposal generated';
+      status.style.color = '#22c55e';
+      renderImprovePanel();
+    }
+  } catch (e) {
+    status.textContent = 'Connection error';
+    status.style.color = '#ef4444';
+  }
+  btn.disabled = false;
+}
+
+async function approveChange(pid, idx) {
+  try {
+    await fetch('/improve/approve', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposal_id: pid, change_index: idx }),
+    });
+    renderImprovePanel();
+    refreshRegistry();
+  } catch {}
+}
+
+async function rejectChange(pid, idx) {
+  try {
+    await fetch('/improve/reject', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposal_id: pid, change_index: idx }),
+    });
+    renderImprovePanel();
+  } catch {}
+}
 </script>
 
 </body>
 </html>"""
 
+# ── Daily improvement scheduler ──────────────────────────────────────────────
+
+def _daily_improvement_loop():
+    """Run improvement cycle daily at midnight UTC."""
+    while True:
+        now = datetime.utcnow()
+        # Calculate seconds until next midnight UTC
+        tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        if tomorrow <= now:
+            tomorrow = tomorrow.replace(day=tomorrow.day + 1)
+        wait = (tomorrow - now).total_seconds()
+        print(f"Improvement agent: next cycle in {wait/3600:.1f} hours (midnight UTC)")
+        time.sleep(wait)
+        try:
+            from improvement_agent import run_improvement_cycle
+            proposal = run_improvement_cycle(API_KEY)
+            print(f"Improvement cycle complete: proposal {proposal['id']}, {proposal['requests_reviewed']} requests reviewed")
+        except Exception as e:
+            print(f"Improvement cycle failed: {e}")
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Start daily improvement scheduler in background
+    t = threading.Thread(target=_daily_improvement_loop, daemon=True)
+    t.start()
+    print("Daily improvement scheduler registered")
+
     port = int(os.environ.get("PORT", 5000))
     print(f"LifeBridge starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
