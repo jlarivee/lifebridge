@@ -49,6 +49,32 @@ Gaps:        What capability, information, or connector is missing that would ch
              improve the answer?
 ──────────────────────────
 
+After completing the reasoning chain, assign a confidence score (0–100)
+representing how certain you are that this routing decision is correct.
+
+Base the score on:
+- How clearly the request matched known domain signals (registry or learned context)
+- How complete the information was (no missing entities or ambiguous intent)
+- Whether a capable agent exists vs. a build brief is needed
+- Whether approval flags were triggered
+
+Add this line as the final line of the REASONING block:
+Confidence:  [score]/100 — [one sentence explaining the main source of uncertainty,
+or 'High confidence — clear match to known patterns' if score is 90+]
+
+Confidence gates:
+- 90–100: proceed normally
+- 70–89: surface the reasoning automatically (do not collapse it)
+- below 70: add this line at the top of the routing package:
+  ⚠ LOW CONFIDENCE — review reasoning before acting
+- below 50: do not produce a routing package. Instead output:
+  CLARIFICATION REQUIRED
+  ──────────────────────────
+  Confidence too low to route safely: [score]/100
+  Missing: [what specific information would resolve the uncertainty]
+  Question: [single precise clarifying question]
+  ──────────────────────────
+
 The routing package or build brief always follows immediately after the REASONING block.
 Never skip the reasoning chain. It is not optional.
 

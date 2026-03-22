@@ -17,14 +17,30 @@ SYSTEM_PROMPT_PATH = ROOT / "system-prompt.txt"
 REGISTRY_PATH = ROOT / "registry.json"
 REQUEST_LOG_PATH = ROOT / "request-log.json"
 HISTORY_PATH = ROOT / "improvement-history.json"
+CONTEXT_PATH = ROOT / "context.json"
 
-IMPROVEMENT_SYSTEM = """You are the LifeBridge Improvement Agent. Your job is to analyze how the master agent has been performing and propose specific, evidence-based improvements. You never execute changes. You only propose them. Every proposal must cite specific evidence from the request log. Vague suggestions are not acceptable."""
+IMPROVEMENT_SYSTEM = """You are the LifeBridge Improvement Agent. Your job is to analyze how the master agent has been performing and propose specific, evidence-based improvements. You never execute changes. You only propose them. Every proposal must cite specific evidence from the request log. Vague suggestions are not acceptable.
+
+You may propose Context additions — new entries for context.json — when you observe a pattern in the request log or rejection feedback that represents a durable, reusable fact about how this system should behave. Context entries must be plain English statements, specific, and actionable.
+
+Good: 'When routing requests about pricing, always check for currency and market constraints before selecting an agent.'
+Bad: 'The user prefers good routing.' (too vague)
+Bad: 'Always be accurate.' (not specific to a pattern)"""
 
 IMPROVEMENT_USER_TEMPLATE = """Here is the current master agent system prompt:
 {system_prompt}
 
 Here is the current registry:
 {registry}
+
+Here is the current global context (durable facts the master agent reads on every call):
+{context}
+
+Here are the rejection feedback entries from the request log (entries where outcome = rejected):
+{rejections}
+
+These are the highest-priority signal. Every proposed change must first address any pattern
+visible in the rejection feedback before analyzing other log patterns.
 
 Here is the request log (last 50 entries max):
 {request_log}
@@ -78,10 +94,17 @@ def run_improvement_cycle(api_key):
     registry = json.dumps(_load_json(REGISTRY_PATH) if REGISTRY_PATH.exists() else {}, indent=2)
     request_log = _load_json(REQUEST_LOG_PATH)
     history = _load_json(HISTORY_PATH)
+    context = json.dumps(_load_json(CONTEXT_PATH) if CONTEXT_PATH.exists() else {}, indent=2)
 
     # Last 50 entries only
     recent_log = request_log[-50:]
     today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Extract rejection feedback (highest priority signal)
+    rejections = [
+        {"input": e.get("input", ""), "response_excerpt": e.get("raw_response", "")[:500], "feedback": e.get("feedback", "")}
+        for e in request_log if e.get("outcome") == "rejected" and e.get("feedback")
+    ]
 
     # Step 2 — Build and send the improvement prompt
     client = anthropic.Anthropic(api_key=api_key)
@@ -89,6 +112,8 @@ def run_improvement_cycle(api_key):
     user_msg = IMPROVEMENT_USER_TEMPLATE.format(
         system_prompt=system_prompt,
         registry=registry,
+        context=context,
+        rejections=json.dumps(rejections, indent=2, default=str) if rejections else "No rejection feedback yet.",
         request_log=json.dumps(recent_log, indent=2, default=str),
         history=json.dumps(history, indent=2, default=str),
         date=today,
@@ -178,6 +203,30 @@ def apply_change(proposal_id, change_index):
         registry.setdefault("connectors", []).append(entry)
         _save_json(REGISTRY_PATH, registry)
         applied = f"Connector addition: added to connectors list"
+
+    elif "context addition" in change_type:
+        proposed = change.get("proposed", "")
+        ctx = _load_json(CONTEXT_PATH) if CONTEXT_PATH.exists() else {"preferences": [], "constraints": [], "learned_patterns": [], "last_updated": ""}
+
+        # Determine which array to add to based on content keywords
+        target_array = "learned_patterns"  # default
+        lower = proposed.lower()
+        if any(w in lower for w in ["prefer", "always use", "default to", "style"]):
+            target_array = "preferences"
+        elif any(w in lower for w in ["never", "must not", "constraint", "forbidden", "require"]):
+            target_array = "constraints"
+
+        entry = {
+            "id": str(uuid.uuid4()),
+            "content": proposed,
+            "source": "improvement_agent",
+            "added": datetime.utcnow().isoformat(),
+            "approved_by": "human",
+        }
+        ctx.setdefault(target_array, []).append(entry)
+        ctx["last_updated"] = datetime.utcnow().isoformat()
+        _save_json(CONTEXT_PATH, ctx)
+        applied = f"Context addition: added to {target_array}"
 
     elif "no change" in change_type:
         applied = "No change needed — acknowledged"

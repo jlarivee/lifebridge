@@ -30,6 +30,7 @@ ROOT = Path(__file__).parent
 SYSTEM_PROMPT = (ROOT / "system-prompt.txt").read_text()
 REGISTRY_PATH = ROOT / "registry.json"
 REQUEST_LOG_PATH = ROOT / "request-log.json"
+CONTEXT_PATH = ROOT / "context.json"
 
 client = anthropic.Anthropic(api_key=API_KEY)
 app = Flask(__name__)
@@ -49,10 +50,16 @@ def _parse_routing_field(text, field):
     match = re.search(rf'{field}:\s*(.+)', text)
     return match.group(1).strip() if match else ""
 
+def _parse_confidence(text):
+    """Extract confidence score from REASONING block."""
+    match = re.search(r'Confidence:\s*(\d+)/100', text)
+    return int(match.group(1)) if match else None
+
 def log_request(user_input, response_text):
-    """Append a request entry to request-log.json."""
+    """Append a request entry to request-log.json. Returns the entry id."""
+    entry_id = str(uuid.uuid4())
     entry = {
-        "id": str(uuid.uuid4()),
+        "id": entry_id,
         "timestamp": datetime.utcnow().isoformat(),
         "input": user_input,
         "domain": _parse_routing_field(response_text, "Domain"),
@@ -60,11 +67,15 @@ def log_request(user_input, response_text):
         "approval_required": "APPROVAL REQUIRED" in response_text,
         "clarification_asked": "?" in response_text and "ROUTING PACKAGE" not in response_text,
         "build_brief_triggered": "BUILD BRIEF" in response_text,
+        "confidence": _parse_confidence(response_text),
+        "outcome": None,
+        "feedback": None,
         "raw_response": response_text,
     }
     log = _load_json(REQUEST_LOG_PATH)
     log.append(entry)
     _save_json(REQUEST_LOG_PATH, log)
+    return entry_id
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
@@ -78,8 +89,14 @@ def save_registry(data):
 
 # ── Master agent ─────────────────────────────────────────────────────────────
 
+def _load_context():
+    if CONTEXT_PATH.exists():
+        return json.loads(CONTEXT_PATH.read_text())
+    return {"preferences": [], "constraints": [], "learned_patterns": [], "last_updated": ""}
+
 def route_request(user_input):
     registry = load_registry()
+    context = _load_context()
 
     registry_block = f"""[REGISTRY STATE]
 Agents: {json.dumps(registry.get('agents', []))}
@@ -89,12 +106,25 @@ Domain signals learned: {json.dumps(registry.get('domain_signals', []))}
 Pending builds: {json.dumps(registry.get('pending_builds', []))}
 [END REGISTRY STATE]"""
 
-    messages = [{
-        "role": "user",
-        "content": f"""{registry_block}
+    # Inject global context if non-empty
+    context_block = ""
+    prefs = [e["content"] for e in context.get("preferences", []) if e.get("content")]
+    constraints = [e["content"] for e in context.get("constraints", []) if e.get("content")]
+    patterns = [e["content"] for e in context.get("learned_patterns", []) if e.get("content")]
+    if prefs or constraints or patterns:
+        parts = ["[GLOBAL CONTEXT]"]
+        if prefs: parts.append("Preferences: " + "; ".join(prefs))
+        if constraints: parts.append("Constraints: " + "; ".join(constraints))
+        if patterns: parts.append("Learned patterns: " + "; ".join(patterns))
+        parts.append("[END GLOBAL CONTEXT]")
+        context_block = "\n".join(parts)
 
-User request: {user_input}"""
-    }]
+    user_msg = registry_block
+    if context_block:
+        user_msg += "\n\n" + context_block
+    user_msg += f"\n\nUser request: {user_input}"
+
+    messages = [{"role": "user", "content": user_msg}]
 
     resp = client.messages.create(
         model=MODEL,
@@ -116,8 +146,9 @@ def api_route():
 
     try:
         output = route_request(user_input)
-        log_request(user_input, output)
-        return jsonify({"input": user_input, "output": output})
+        entry_id = log_request(user_input, output)
+        confidence = _parse_confidence(output)
+        return jsonify({"id": entry_id, "input": user_input, "confidence": confidence, "output": output})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -141,6 +172,38 @@ def api_registry_update():
 
     save_registry(registry)
     return jsonify({"status": "updated", "registry": registry})
+
+# ── Feedback endpoint ────────────────────────────────────────────────────────
+
+@app.route("/route/feedback", methods=["POST"])
+def api_route_feedback():
+    body = request.get_json(silent=True) or {}
+    request_id = body.get("request_id", "")
+    outcome = body.get("outcome", "")
+    feedback_text = body.get("feedback", "")
+
+    if not request_id or outcome not in ("accepted", "rejected"):
+        return jsonify({"error": "request_id and outcome (accepted/rejected) required"}), 400
+
+    log = _load_json(REQUEST_LOG_PATH)
+    found = False
+    for entry in log:
+        if entry.get("id") == request_id:
+            entry["outcome"] = outcome
+            entry["feedback"] = feedback_text if outcome == "rejected" else None
+            entry["feedback_timestamp"] = datetime.utcnow().isoformat()
+            found = True
+            break
+
+    if not found:
+        return jsonify({"error": "request_id not found in log"}), 404
+
+    _save_json(REQUEST_LOG_PATH, log)
+    return jsonify({"success": True, "outcome": outcome})
+
+@app.route("/context", methods=["GET"])
+def api_context():
+    return jsonify(_load_context())
 
 # ── Improvement endpoints ────────────────────────────────────────────────────
 
@@ -438,7 +501,9 @@ async function send() {
     if (data.error) {
       el.querySelector('.body').textContent = 'ERROR: ' + data.error;
     } else {
-      el.querySelector('.body').innerHTML = formatResponse(data.output);
+      const conf = data.confidence;
+      const reqId = data.id;
+      el.querySelector('.body').innerHTML = formatResponse(data.output, conf) + renderFeedback(reqId) + renderConfidence(conf);
     }
   } catch (e) {
     const el = document.getElementById(loadId);
@@ -452,20 +517,24 @@ async function send() {
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-function formatResponse(raw) {
+function formatResponse(raw, confidence) {
+  // Check for CLARIFICATION REQUIRED (confidence < 50)
+  if (raw.includes('CLARIFICATION REQUIRED')) {
+    return `<div style="background:#f59e0b18;border:1px solid #f59e0b44;border-radius:8px;padding:16px;margin-bottom:8px;"><div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:#f59e0b;letter-spacing:0.08em;margin-bottom:8px;">⚠ CLARIFICATION REQUIRED</div>${esc(raw)}</div>`;
+  }
+
   // Split on REASONING block boundaries
   const reasoningStart = raw.indexOf('REASONING');
   if (reasoningStart === -1) return esc(raw);
 
-  // Find the end of the reasoning block (next ────── line after the content)
   const lines = raw.split('\\n');
   let rStart = -1, rEnd = -1, dashCount = 0;
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].trim().startsWith('REASONING')) { rStart = i; dashCount = 0; continue; }
     if (rStart >= 0 && lines[i].includes('──────')) {
       dashCount++;
-      if (dashCount === 1) continue; // opening line
-      if (dashCount === 2) { rEnd = i; break; } // closing line
+      if (dashCount === 1) continue;
+      if (dashCount === 2) { rEnd = i; break; }
     }
   }
 
@@ -476,12 +545,64 @@ function formatResponse(raw) {
   const after = lines.slice(rEnd + 1).join('\\n').trim();
 
   const toggleId = 'reason-' + Date.now();
+  const autoExpand = confidence !== null && confidence < 90;
+  const lowConfWarn = confidence !== null && confidence < 70;
+
   let html = '';
+  if (lowConfWarn) {
+    html += `<div style="background:#ef444418;border:1px solid #ef444444;border-radius:6px;padding:10px 14px;margin-bottom:10px;font-family:'JetBrains Mono',monospace;font-size:11px;color:#ef4444;">⚠ LOW CONFIDENCE — review the reasoning before acting on this</div>`;
+  }
   if (before) html += esc(before) + '\\n';
-  html += `<div class="reasoning-toggle" onclick="document.getElementById('${toggleId}').style.display = document.getElementById('${toggleId}').style.display === 'none' ? 'block' : 'none'">▶ Show reasoning</div>`;
-  html += `<div id="${toggleId}" style="display:none"><div class="reasoning-label">Agent reasoning</div><div class="reasoning-block">${esc(reasoning)}</div></div>`;
+  html += `<div class="reasoning-toggle" onclick="document.getElementById('${toggleId}').style.display = document.getElementById('${toggleId}').style.display === 'none' ? 'block' : 'none'">${autoExpand ? '▼' : '▶'} ${autoExpand ? 'Hide' : 'Show'} reasoning</div>`;
+  html += `<div id="${toggleId}" style="display:${autoExpand ? 'block' : 'none'}"><div class="reasoning-label">Agent reasoning</div><div class="reasoning-block">${esc(reasoning)}</div></div>`;
   if (after) html += esc(after);
   return html;
+}
+
+function renderFeedback(requestId) {
+  const fbId = 'fb-' + requestId.slice(0,8);
+  return `<div id="${fbId}" style="margin-top:12px;display:flex;gap:8px;align-items:center;">
+    <button onclick="sendFeedback('${requestId}','accepted','${fbId}')" style="font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid #2a4a2a;background:transparent;color:#22c55e;cursor:pointer;">Looks good</button>
+    <button onclick="showFeedbackInput('${fbId}','${requestId}')" style="font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 10px;border-radius:4px;border:1px solid #4a2a2a;background:transparent;color:#ef4444;cursor:pointer;">Something's wrong</button>
+  </div>`;
+}
+
+function renderConfidence(conf) {
+  if (conf === null || conf === undefined) return '';
+  let color, label;
+  if (conf >= 90) { color = '#22c55e'; label = 'High confidence'; }
+  else if (conf >= 70) { color = '#f59e0b'; label = 'Moderate confidence'; }
+  else { color = '#ef4444'; label = 'Low confidence'; }
+  return `<div style="margin-top:8px;display:flex;align-items:center;gap:6px;">
+    <span style="width:8px;height:8px;border-radius:50%;background:${color};display:inline-block;"></span>
+    <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:${color};">${label} (${conf}/100)</span>
+  </div>`;
+}
+
+function showFeedbackInput(fbId, requestId) {
+  document.getElementById(fbId).innerHTML = `
+    <input id="fbtxt-${fbId}" type="text" placeholder="What was wrong with this routing?" style="flex:1;background:#16161e;border:1px solid #4a2a2a;border-radius:6px;color:#d4d4dc;padding:6px 10px;font-size:12px;outline:none;font-family:'Inter',sans-serif;">
+    <button onclick="submitFeedback('${requestId}','${fbId}')" style="font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 10px;border-radius:4px;border:none;background:#ef4444;color:#fff;cursor:pointer;">Submit</button>
+    <button onclick="document.getElementById('${fbId}').remove()" style="font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 8px;border-radius:4px;border:1px solid #333;background:transparent;color:#555;cursor:pointer;">Cancel</button>
+  `;
+}
+
+async function sendFeedback(requestId, outcome, fbId) {
+  try {
+    await fetch('/route/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({request_id:requestId,outcome:outcome}) });
+    document.getElementById(fbId).innerHTML = '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#555;">✓ Feedback recorded</span>';
+    setTimeout(() => { const el = document.getElementById(fbId); if(el) el.remove(); }, 2000);
+  } catch {}
+}
+
+async function submitFeedback(requestId, fbId) {
+  const text = document.getElementById('fbtxt-'+fbId)?.value || '';
+  if (!text.trim()) return;
+  try {
+    await fetch('/route/feedback', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({request_id:requestId,outcome:'rejected',feedback:text.trim()}) });
+    document.getElementById(fbId).innerHTML = '<span style="font-family:JetBrains Mono,monospace;font-size:10px;color:#ef4444;">✓ Feedback recorded</span>';
+    setTimeout(() => { const el = document.getElementById(fbId); if(el) el.remove(); }, 2000);
+  } catch {}
 }
 
 async function refreshRegistry() {
@@ -566,6 +687,9 @@ async function renderImprovePanel() {
   if (history.length === 0) {
     html += `<div style="color:#333;font-style:italic;margin-top:20px;">No improvement proposals yet. Run a cycle after routing some requests.</div>`;
   }
+
+  // Global context section
+  html += await renderGlobalContext();
 
   panel.innerHTML = html;
 }
@@ -700,6 +824,33 @@ async function approveChange(pid, idx) {
     renderImprovePanel();
     refreshRegistry();
   } catch {}
+}
+
+async function renderGlobalContext() {
+  try {
+    const res = await fetch('/context');
+    const ctx = await res.json();
+    const sections = [
+      ['Preferences', ctx.preferences || []],
+      ['Constraints', ctx.constraints || []],
+      ['Learned Patterns', ctx.learned_patterns || []],
+    ];
+    const hasAny = sections.some(([,items]) => items.length > 0);
+    let html = `<div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.12em;color:#6366f1;text-transform:uppercase;margin:24px 0 12px;">Global Context</div>`;
+    if (!hasAny) {
+      html += `<div style="color:#333;font-style:italic;">No context entries yet. Context grows as the improvement agent learns.</div>`;
+      return html;
+    }
+    for (const [title, items] of sections) {
+      html += `<div style="margin-bottom:12px;"><div class="change-field">${title} (${items.length})</div>`;
+      if (items.length === 0) { html += `<div class="empty">None</div>`; }
+      for (const item of items) {
+        html += `<div class="entry" style="margin-bottom:4px;">${esc(item.content || '')} <span style="color:#444;font-size:9px;">${item.source || ''} · ${(item.added||'').slice(0,10)}</span></div>`;
+      }
+      html += `</div>`;
+    }
+    return html;
+  } catch { return ''; }
 }
 
 async function rejectChange(pid, idx) {
