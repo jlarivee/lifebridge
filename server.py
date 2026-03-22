@@ -171,6 +171,11 @@ def api_registry_update():
         registry.setdefault("connectors", []).append(body["connector"])
 
     save_registry(registry)
+    try:
+        from github_sync import commit_state_file
+        commit_state_file("registry.json", "Registry manually updated")
+    except Exception:
+        pass
     return jsonify({"status": "updated", "registry": registry})
 
 # ── Feedback endpoint ────────────────────────────────────────────────────────
@@ -212,6 +217,12 @@ def api_improve_run():
     try:
         from improvement_agent import run_improvement_cycle
         proposal = run_improvement_cycle(API_KEY)
+        try:
+            from github_sync import commit_state_file
+            changes_count = len(proposal.get("proposal", "").split("Change [")) - 1
+            commit_state_file("improvement-history.json", f"Improvement cycle completed — {max(changes_count, 0)} changes proposed")
+        except Exception:
+            pass
         return jsonify(proposal)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -229,6 +240,19 @@ def api_improve_approve():
         # Reload system prompt in case it was edited
         global SYSTEM_PROMPT
         SYSTEM_PROMPT = (ROOT / "system-prompt.txt").read_text()
+        # Sync changed files to GitHub
+        try:
+            from github_sync import commit_state_file
+            reason = f"Proposal {pid[:8]} approved — change {cidx}"
+            if "system prompt" in desc.lower():
+                commit_state_file("system-prompt.txt", reason)
+            if "registry" in desc.lower():
+                commit_state_file("registry.json", reason)
+            if "context" in desc.lower():
+                commit_state_file("context.json", reason)
+            commit_state_file("improvement-history.json", reason)
+        except Exception:
+            pass
         return jsonify({"success": True, "change_applied": desc})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -243,6 +267,11 @@ def api_improve_reject():
     try:
         from improvement_agent import reject_change
         reject_change(pid, int(cidx))
+        try:
+            from github_sync import commit_state_file
+            commit_state_file("improvement-history.json", f"Proposal {pid[:8]} change {cidx} rejected")
+        except Exception:
+            pass
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -250,6 +279,13 @@ def api_improve_reject():
 @app.route("/improve/history", methods=["GET"])
 def api_improve_history():
     return jsonify(_load_json(ROOT / "improvement-history.json"))
+
+@app.route("/sync/status", methods=["GET"])
+def api_sync_status():
+    status_path = ROOT / "sync-status.json"
+    if status_path.exists():
+        return jsonify(json.loads(status_path.read_text()))
+    return jsonify({"enabled": False, "last_sync": None, "last_sync_result": None, "last_commit_sha": None})
 
 @app.route("/")
 def index():
@@ -862,8 +898,37 @@ async function rejectChange(pid, idx) {
     renderImprovePanel();
   } catch {}
 }
+
+// ── Sync status footer ──────────────────────────────────────────
+async function updateSyncStatus() {
+  const el = document.getElementById('sync-status');
+  if (!el) return;
+  try {
+    const res = await fetch('/sync/status');
+    const s = await res.json();
+    let dot, label;
+    if (!s.enabled) { dot = '#555'; label = 'Sync disabled'; }
+    else if (s.last_sync_result === 'success') { dot = '#22c55e'; label = 'Synced'; }
+    else if (s.last_sync_result === 'failed') { dot = '#ef4444'; label = 'Sync failed'; }
+    else { dot = '#f59e0b'; label = 'Sync pending'; }
+
+    let timeAgo = '';
+    if (s.last_sync) {
+      const diff = Math.floor((Date.now() - new Date(s.last_sync + 'Z').getTime()) / 1000);
+      if (diff < 60) timeAgo = 'just now';
+      else if (diff < 3600) timeAgo = Math.floor(diff/60) + 'm ago';
+      else if (diff < 86400) timeAgo = Math.floor(diff/3600) + 'h ago';
+      else timeAgo = Math.floor(diff/86400) + 'd ago';
+    }
+
+    el.innerHTML = `<span style="width:6px;height:6px;border-radius:50%;background:${dot};display:inline-block;"></span> <span>${label}</span>${timeAgo ? ` · ${timeAgo}` : ''}`;
+  } catch {}
+}
+updateSyncStatus();
+setInterval(updateSyncStatus, 60000);
 </script>
 
+<div id="sync-status" style="position:fixed;bottom:0;left:0;right:0;padding:6px 16px;background:#0a0a10;border-top:1px solid #1c1c26;font-family:'JetBrains Mono',monospace;font-size:9px;color:#444;display:flex;align-items:center;gap:6px;z-index:100;"></div>
 </body>
 </html>"""
 
@@ -886,10 +951,25 @@ def _daily_improvement_loop():
             print(f"Improvement cycle complete: proposal {proposal['id']}, {proposal['requests_reviewed']} requests reviewed")
         except Exception as e:
             print(f"Improvement cycle failed: {e}")
+        # Daily full sync to GitHub
+        try:
+            from github_sync import full_sync
+            results = full_sync("Daily full sync")
+            synced = sum(1 for r in results.values() if r.get("synced"))
+            print(f"Daily GitHub sync: {synced}/{len(results)} files synced")
+        except Exception as e:
+            print(f"Daily GitHub sync failed: {e}")
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # GitHub sync startup check
+    try:
+        from github_sync import startup_check
+        startup_check()
+    except Exception as e:
+        print(f"GitHub startup check failed: {e}")
+
     # Start daily improvement scheduler in background
     t = threading.Thread(target=_daily_improvement_loop, daemon=True)
     t.start()
